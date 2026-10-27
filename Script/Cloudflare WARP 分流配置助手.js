@@ -2,7 +2,7 @@
 // @name         Cloudflare WARP 分流配置助手（GFWList 一键部署）
 // @namespace    https://github.com/gfwlist-cf-warp
 // @version      1.0.2
-// @description  在 Cloudflare Zero Trust 控制台一键创建/切换 GFWList 分流配置：完整版(3985条)/精简版(核心站点)/仅内网直连(LAN)。登录后打开 Zero Trust → 设备配置文件页面，点击悬浮按钮即可。
+// @description  在 Cloudflare Zero Trust 控制台一键创建/切换 GFWList 分流配置：完整版(3985条)/精简版(核心站点)/国内直连(绕过国内)[主+续 两份中国段，覆盖尽量全的中国公网]。登录后打开 Zero Trust → 设备配置文件页面，点击悬浮按钮即可。
 // @author       you
 // @match        https://dash.cloudflare.com/*
 // @grant        none
@@ -13,18 +13,20 @@
   "use strict";
 
   /* ================= 配置 ================= */
-  const PRECEDENCE = { full: 1, gfw2: 2, cn: 3, lite: 4 };
+  const PRECEDENCE = { full: 1, gfw2: 2, cn: 3, cn2: 3, lite: 4 };
   const NAMES = {
     full: "GFWList 完整版",
     gfw2: "GFWList 完整版续",
-    cn: "仅内网直连（LAN 直连）",
+    cn: "国内直连（绕过国内·主）",
+    cn2: "国内直连·续（绕过国内续）",
     lite: "GFWList 精简版",
   };
   // 兼容手工创建过的配置名，避免重复建一份
   const ALIAS = {
     full: ["GFWList 完整版", "GFWList 模式（白名单）", "GFWList 模式"],
     gfw2: ["GFWList 完整版续", "GFWList 模式 2（白名单续）", "GFWList 模式 2"],
-    cn: ["仅内网直连（LAN 直连）", "国内直连（绕过国内）", "国内直连"],
+    cn: ["国内直连（绕过国内）", "国内直连", "仅内网直连（LAN 直连）"],
+    cn2: ["国内直连·续", "国内直连续", "仅内网直连·续（中国段续）"],
     lite: ["GFWList 精简版", "GFWList 精简版（核心站点）"],
   };
   const MAX_RULES = 3985; // 单配置上限 4000，留余量
@@ -157,6 +159,42 @@
     return out;
   }
 
+  /* ================= 中国 IP 段（拆主/续两份） ================= */
+  const CHINA_IP_URLS = [
+    "https://fastly.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt",
+    "https://cdn.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt",
+    "https://testingcf.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt",
+    "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt",
+  ];
+
+  async function fetchChinaIPList() {
+    for (const url of CHINA_IP_URLS) {
+      try {
+        log(`下载中国 IP 段: ${new URL(url).host} ...`);
+        const r = await fetch(url);
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return await r.text();
+      } catch (e) {
+        log(`  失败: ${e.message}`, "warn");
+      }
+    }
+    throw new Error("所有中国 IP 段源均下载失败，请检查网络或更换镜像");
+  }
+
+  // 解析 CIDR 列表：每行 1.2.3.4/24，去重并保持顺序
+  function parseChinaCIDRs(raw) {
+    const out = [];
+    const seen = new Set();
+    const re = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/;
+    for (const line of raw.split("\n")) {
+      const s = line.trim();
+      if (!s || s.startsWith("#") || s.startsWith("!")) continue;
+      if (!re.test(s)) continue;
+      if (!seen.has(s)) { seen.add(s); out.push(s); }
+    }
+    return out;
+  }
+
   // 关键站点排在前面，保证截断时优先保留
   const PRIORITY = new Set(CORE);
 
@@ -269,25 +307,34 @@
     log("✅ 精简版部署完成", "ok");
   }
 
+  // 国内直连（主）：中国公网段前段 + LAN，均为 exclude（直连，绕过 WARP）
   async function deployCN() {
-    log("⚠ 提示：此模式默认只排除内网(LAN)，不含中国公网段。", "warn");
-    log("   Cloudflare 默认 exclude 仅含私网(RFC1918/链路本地/组播)，", "warn");
-    log("   中国 IPv4 段约 8800 条、单配置上限约 4000 条，无法全量绕过国内；", "warn");
-    log("   若需‘全国直连+仅翻墙走 WARP’，请改用 GFW 白名单模式(①/②)。", "warn");
-    log("读取默认配置的国内网段名单 ...");
-    const r = await api("GET", "/devices/policy");
-    if (r.status !== 200) throw new Error("读取默认配置失败");
-    const excl = (r.json.result && r.json.result.exclude) || [];
-    log(`默认配置 exclude ${excl.length} 条`);
-    const have = new Set(excl.map((e) => e.address).filter(Boolean));
-    for (const c of LAN_CIDRS) {
-      if (!have.has(c) && excl.length < MAX_RULES) {
-        excl.push({ address: c, description: "LAN" });
-      }
-    }
-    log(`补内网后共 ${excl.length} 条`);
-    await ensureProfile("cn", { description: "仅内网(LAN)直连；中国公网仍走 WARP（受 4000 条上限限制，无法全量绕过国内）", include: [], exclude: excl });
-    log("✅ 仅内网直连部署完成（注意：非全国直连）", "ok");
+    const raw = await fetchChinaIPList();
+    const all = parseChinaCIDRs(raw);
+    log(`中国 IPv4 段共 ${all.length} 条`);
+    const cap = MAX_RULES - LAN_CIDRS.length; // 给 LAN 预留空间
+    const china = all.slice(0, cap);
+    const excl = china.map((c) => ({ address: c, description: "CN" }));
+    for (const c of LAN_CIDRS) excl.push({ address: c, description: "LAN" });
+    log(`主名单：中国段 ${china.length} + LAN ${LAN_CIDRS.length} = ${excl.length} 条`, "ok");
+    log(`⚠ 单份上限 ${cap} 条，未装下的 ${Math.max(0, all.length - cap)} 条中国段请部署「③续」覆盖`, "warn");
+    await ensureProfile("cn", { description: "国内直连（绕过国内·主）：中国公网段前段+LAN 直连", include: [], exclude: excl });
+    log("✅ 国内直连(主)部署完成", "ok");
+  }
+
+  // 国内直连（续）：中国公网段后半段 + LAN，与「主」二选一切换（不能叠加）
+  async function deployCN2() {
+    const raw = await fetchChinaIPList();
+    const all = parseChinaCIDRs(raw);
+    log(`中国 IPv4 段共 ${all.length} 条`);
+    const cap = MAX_RULES - LAN_CIDRS.length;
+    const china = all.slice(cap, cap + cap);
+    if (!china.length) { log("⚠ 中国段不足，无需续名单", "warn"); return; }
+    const excl = china.map((c) => ({ address: c, description: "CN2" }));
+    for (const c of LAN_CIDRS) excl.push({ address: c, description: "LAN" });
+    log(`续名单：中国段 ${china.length} + LAN ${LAN_CIDRS.length} = ${excl.length} 条`, "ok");
+    await ensureProfile("cn2", { description: "国内直连·续（绕过国内续）：中国公网段后段+LAN 直连", include: [], exclude: excl });
+    log("✅ 国内直连(续)部署完成", "ok");
   }
 
   async function switchMode(kind) {
@@ -357,11 +404,13 @@
       <div class="bd">
         <button class="b1" data-act="full">① 部署/更新 完整版（3985条）</button>
         <button class="b2" data-act="lite">② 部署/更新 精简版（核心站点）</button>
-        <button class="b3" data-act="cn" title="仅排除内网(LAN)；中国公网仍走 WARP，真正全国直连请用 GFW 白名单模式">③ 部署/更新 仅内网直连(LAN)</button>
+        <button class="b3" data-act="cn" title="中国公网段前段+内网直连（绕过 WARP）；单份装不下的段由「③续」覆盖">③ 部署/更新 国内直连（绕过国内·主）</button>
+        <button class="b3" data-act="cn2" title="中国公网段后段直连（主名单装不下的部分）。与「主」二选一切换，不能叠加">③续 部署/更新 国内直连·续</button>
         <hr style="border:0;border-top:1px solid #eee;margin:2px 0">
         <button class="b1" data-act="sw-full">切换→ 完整版</button>
         <button class="b1" data-act="sw-lite">切换→ 精简版</button>
-        <button class="b3" data-act="sw-cn">切换→ 仅内网直连</button>
+        <button class="b3" data-act="sw-cn">切换→ 国内直连（主）</button>
+        <button class="b3" data-act="sw-cn2">切换→ 国内直连·续</button>
         <button class="b4" data-act="status">查看当前状态</button>
         <div id="gfw-log"></div>
       </div>
@@ -436,9 +485,11 @@
         if (act === "full") await deployFull();
         else if (act === "lite") await deployLite();
         else if (act === "cn") await deployCN();
+        else if (act === "cn2") await deployCN2();
         else if (act === "sw-full") await switchMode("full");
         else if (act === "sw-lite") await switchMode("lite");
         else if (act === "sw-cn") await switchMode("cn");
+        else if (act === "sw-cn2") await switchMode("cn2");
         else if (act === "status") { $("#gfw-log").innerHTML = ""; await showStatus(); }
       } catch (err) {
         log("❌ " + err.message, "err");
