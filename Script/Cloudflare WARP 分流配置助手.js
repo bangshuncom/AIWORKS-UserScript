@@ -2,7 +2,7 @@
 // @name         Cloudflare WARP 分流配置助手（GFWList 一键部署）
 // @namespace    https://github.com/gfwlist-cf-warp
 // @version      1.0.2
-// @description  在 Cloudflare Zero Trust 控制台一键创建/切换 GFWList 分流配置：完整版(3985条)/精简版(核心站点)/国内直连(绕过国内)[主+续 两份中国段，覆盖尽量全的中国公网]。登录后打开 Zero Trust → 设备配置文件页面，点击悬浮按钮即可。
+// @description  在 Cloudflare Zero Trust 控制台一键创建/切换 GFWList 分流配置：完整版(3985条)/精简版(核心站点)/国内直连(绕过国内)[主+续 两份中国段]/国内直连·域名[*.cn通配+常用站+随机中国IP]。登录后打开 Zero Trust → 设备配置文件页面，点击悬浮按钮即可。
 // @author       you
 // @match        https://dash.cloudflare.com/*
 // @grant        none
@@ -13,12 +13,13 @@
   "use strict";
 
   /* ================= 配置 ================= */
-  const PRECEDENCE = { full: 1, gfw2: 2, cn: 3, cn2: 3, lite: 4 };
+  const PRECEDENCE = { full: 1, gfw2: 2, cn: 3, cn2: 3, cnd: 5, lite: 4 };
   const NAMES = {
     full: "GFWList 完整版",
     gfw2: "GFWList 完整版续",
     cn: "国内直连（绕过国内·主）",
     cn2: "国内直连·续（绕过国内续）",
+    cnd: "国内直连·域名（.cn通配+常用站+IP）",
     lite: "GFWList 精简版",
   };
   // 兼容手工创建过的配置名，避免重复建一份
@@ -27,6 +28,7 @@
     gfw2: ["GFWList 完整版续", "GFWList 模式 2（白名单续）", "GFWList 模式 2"],
     cn: ["国内直连（绕过国内）", "国内直连", "仅内网直连（LAN 直连）"],
     cn2: ["国内直连·续", "国内直连续", "仅内网直连·续（中国段续）"],
+    cnd: ["国内直连·域名", "国内直连续域名"],
     lite: ["GFWList 精简版", "GFWList 精简版（核心站点）"],
   };
   const MAX_RULES = 3985; // 单配置上限 4000，留余量
@@ -195,6 +197,53 @@
     return out;
   }
 
+  /* ================= 国内域名列表（felixonmars/dnsmasq-china-list） ================= */
+  const CHINA_DOMAIN_URLS = [
+    "https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/accelerated-domains.china.conf",
+    "https://cdn.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/accelerated-domains.china.conf",
+    "https://testingcf.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/accelerated-domains.china.conf",
+    "https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf",
+  ];
+
+  async function fetchChinaDomains() {
+    for (const url of CHINA_DOMAIN_URLS) {
+      try {
+        log(`下载国内域名列表: ${new URL(url).host} ...`);
+        const r = await fetch(url);
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return await r.text();
+      } catch (e) {
+        log(`  失败: ${e.message}`, "warn");
+      }
+    }
+    throw new Error("所有国内域名源均下载失败，请检查网络或更换镜像");
+  }
+
+  // 提取 dnsmasq 格式 server=/domain/ 的域名；过滤掉会被 *.cn/*.com.cn 通配覆盖的后缀
+  function parseChinaDomains(raw) {
+    const out = [];
+    const seen = new Set();
+    const re = /server=\/([^/]+)\//;
+    for (const line of raw.split("\n")) {
+      const m = line.match(re);
+      if (!m) continue;
+      const d = m[1].toLowerCase();
+      if (d.endsWith(".cn") || d.endsWith(".com.cn")) continue; // 已被通配覆盖
+      if (!seen.has(d)) { seen.add(d); out.push(d); }
+    }
+    return out;
+  }
+
+  // Fisher-Yates 洗牌，用于随机抽 IP / 域名
+  function shuffle(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+
   // 关键站点排在前面，保证截断时优先保留
   const PRIORITY = new Set(CORE);
 
@@ -337,6 +386,32 @@
     log("✅ 国内直连(续)部署完成", "ok");
   }
 
+  // 国内直连·域名：*.cn/*.com.cn 通配 + 国内常用域名(随机1000) + 随机中国 IP(2900)，均为 exclude（直连）
+  async function deployCND() {
+    // 通配域名：覆盖所有 .cn / .com.cn，无需枚举
+    const hosts = ["*.cn", "*.com.cn"];
+    // 国内常用域名：dnsmasq-china-list，过滤掉已被通配覆盖的 .cn 后缀，随机取 1000
+    const dr = await fetchChinaDomains();
+    const doms = parseChinaDomains(dr);
+    log(`国内域名去重后 ${doms.length} 条`);
+    const DOMAIN_CAP = 1000;
+    const domPick = shuffle(doms).slice(0, DOMAIN_CAP);
+    // 随机中国 IP（IPv4）2900 条
+    const ir = await fetchChinaIPList();
+    const ips = parseChinaCIDRs(ir);
+    const IP_CAP = 2900;
+    const ipPick = shuffle(ips).slice(0, IP_CAP);
+    log(`随机抽中国 IP ${ipPick.length} 条`, "ok");
+    const excl = [];
+    for (const h of hosts) excl.push({ host: h, description: "CN-TLD" });
+    for (const d of domPick) excl.push({ host: d, description: "CN-DOM" });
+    for (const c of ipPick) excl.push({ address: c, description: "CN-IP" });
+    for (const c of LAN_CIDRS) excl.push({ address: c, description: "LAN" });
+    log(`合计 ${excl.length} 条（通配2 + 域名${domPick.length} + IP${ipPick.length} + LAN${LAN_CIDRS.length}）`, "ok");
+    await ensureProfile("cnd", { description: "国内直连·域名：*.cn/*.com.cn 通配 + 常用国内站 + 随机中国 IP", include: [], exclude: excl });
+    log("✅ 国内直连·域名 部署完成", "ok");
+  }
+
   async function switchMode(kind) {
     const names = [NAMES[kind], ...(ALIAS[kind] || [])];
     const policies = await listPolicies();
@@ -406,11 +481,13 @@
         <button class="b2" data-act="lite">② 部署/更新 精简版（核心站点）</button>
         <button class="b3" data-act="cn" title="中国公网段前段+内网直连（绕过 WARP）；单份装不下的段由「③续」覆盖">③ 部署/更新 国内直连（绕过国内·主）</button>
         <button class="b3" data-act="cn2" title="中国公网段后段直连（主名单装不下的部分）。与「主」二选一切换，不能叠加">③续 部署/更新 国内直连·续</button>
+        <button class="b3" data-act="cnd" title="*.cn/*.com.cn 通配 + 随机1000常用国内站 + 随机2900中国IP，全部直连。覆盖国内最广">④ 部署/更新 国内直连·域名</button>
         <hr style="border:0;border-top:1px solid #eee;margin:2px 0">
         <button class="b1" data-act="sw-full">切换→ 完整版</button>
         <button class="b1" data-act="sw-lite">切换→ 精简版</button>
         <button class="b3" data-act="sw-cn">切换→ 国内直连（主）</button>
         <button class="b3" data-act="sw-cn2">切换→ 国内直连·续</button>
+        <button class="b3" data-act="sw-cnd">切换→ 国内直连·域名</button>
         <button class="b4" data-act="status">查看当前状态</button>
         <div id="gfw-log"></div>
       </div>
@@ -486,10 +563,12 @@
         else if (act === "lite") await deployLite();
         else if (act === "cn") await deployCN();
         else if (act === "cn2") await deployCN2();
+        else if (act === "cnd") await deployCND();
         else if (act === "sw-full") await switchMode("full");
         else if (act === "sw-lite") await switchMode("lite");
         else if (act === "sw-cn") await switchMode("cn");
         else if (act === "sw-cn2") await switchMode("cn2");
+        else if (act === "sw-cnd") await switchMode("cnd");
         else if (act === "status") { $("#gfw-log").innerHTML = ""; await showStatus(); }
       } catch (err) {
         log("❌ " + err.message, "err");
