@@ -1,0 +1,10 @@
+# WorkBuddy local data (project-specific agent memory, not source)
+.workbuddy/
+
+# OS / editor cruft
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~
