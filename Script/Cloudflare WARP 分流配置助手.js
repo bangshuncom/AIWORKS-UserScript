@@ -2,7 +2,7 @@
 // @name         Cloudflare WARP 分流配置助手（GFWList 一键部署）
 // @namespace    https://github.com/gfwlist-cf-warp
 // @version      1.0.2
-// @description  在 Cloudflare Zero Trust 控制台一键创建/切换 GFWList 分流配置：完整版(3985条)/精简版(核心站点)/国内直连。登录后打开 Zero Trust → 设备配置文件页面，点击悬浮按钮即可。
+// @description  在 Cloudflare Zero Trust 控制台一键创建/切换 GFWList 分流配置：完整版(3985条)/精简版(核心站点)/仅内网直连(LAN)。登录后打开 Zero Trust → 设备配置文件页面，点击悬浮按钮即可。
 // @author       you
 // @match        https://dash.cloudflare.com/*
 // @grant        none
@@ -17,14 +17,14 @@
   const NAMES = {
     full: "GFWList 完整版",
     gfw2: "GFWList 完整版续",
-    cn: "国内直连（绕过国内）",
+    cn: "仅内网直连（LAN 直连）",
     lite: "GFWList 精简版",
   };
   // 兼容手工创建过的配置名，避免重复建一份
   const ALIAS = {
     full: ["GFWList 完整版", "GFWList 模式（白名单）", "GFWList 模式"],
     gfw2: ["GFWList 完整版续", "GFWList 模式 2（白名单续）", "GFWList 模式 2"],
-    cn: ["国内直连（绕过国内）", "国内直连"],
+    cn: ["仅内网直连（LAN 直连）", "国内直连（绕过国内）", "国内直连"],
     lite: ["GFWList 精简版", "GFWList 精简版（核心站点）"],
   };
   const MAX_RULES = 3985; // 单配置上限 4000，留余量
@@ -270,6 +270,10 @@
   }
 
   async function deployCN() {
+    log("⚠ 提示：此模式默认只排除内网(LAN)，不含中国公网段。", "warn");
+    log("   Cloudflare 默认 exclude 仅含私网(RFC1918/链路本地/组播)，", "warn");
+    log("   中国 IPv4 段约 8800 条、单配置上限约 4000 条，无法全量绕过国内；", "warn");
+    log("   若需‘全国直连+仅翻墙走 WARP’，请改用 GFW 白名单模式(①/②)。", "warn");
     log("读取默认配置的国内网段名单 ...");
     const r = await api("GET", "/devices/policy");
     if (r.status !== 200) throw new Error("读取默认配置失败");
@@ -282,15 +286,16 @@
       }
     }
     log(`补内网后共 ${excl.length} 条`);
-    await ensureProfile("cn", { description: "国内网段直连，其余走 WARP", include: [], exclude: excl });
-    log("✅ 国内直连部署完成", "ok");
+    await ensureProfile("cn", { description: "仅内网(LAN)直连；中国公网仍走 WARP（受 4000 条上限限制，无法全量绕过国内）", include: [], exclude: excl });
+    log("✅ 仅内网直连部署完成（注意：非全国直连）", "ok");
   }
 
   async function switchMode(kind) {
-    const target = NAMES[kind];
+    const names = [NAMES[kind], ...(ALIAS[kind] || [])];
     const policies = await listPolicies();
-    const t = policies.find((p) => p.name === target);
-    if (!t) throw new Error(`配置「${target}」不存在，请先部署`);
+    const t = policies.find((p) => names.includes(p.name));
+    if (!t) throw new Error(`配置「${NAMES[kind]}」不存在，请先部署`);
+    const target = t.name;
     for (const p of policies) {
       if (p.default) continue; // 默认配置不动
       const want = p.name === target;
@@ -352,11 +357,11 @@
       <div class="bd">
         <button class="b1" data-act="full">① 部署/更新 完整版（3985条）</button>
         <button class="b2" data-act="lite">② 部署/更新 精简版（核心站点）</button>
-        <button class="b3" data-act="cn">③ 部署/更新 国内直连</button>
+        <button class="b3" data-act="cn" title="仅排除内网(LAN)；中国公网仍走 WARP，真正全国直连请用 GFW 白名单模式">③ 部署/更新 仅内网直连(LAN)</button>
         <hr style="border:0;border-top:1px solid #eee;margin:2px 0">
         <button class="b1" data-act="sw-full">切换→ 完整版</button>
         <button class="b1" data-act="sw-lite">切换→ 精简版</button>
-        <button class="b3" data-act="sw-cn">切换→ 国内直连</button>
+        <button class="b3" data-act="sw-cn">切换→ 仅内网直连</button>
         <button class="b4" data-act="status">查看当前状态</button>
         <div id="gfw-log"></div>
       </div>
