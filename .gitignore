@@ -1,6 +1,9 @@
 # WorkBuddy local data (project-specific agent memory, not source)
 .workbuddy/
 
+# 本地开发辅助脚本（含本地专属配置，不入库）
+dev.bat
+
 # OS / editor cruft
 Thumbs.db
 ehthumbs.db
